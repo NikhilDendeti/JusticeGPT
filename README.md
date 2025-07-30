@@ -12,6 +12,7 @@ Build a system that can:
 2. Let users query policy coverage in natural language.
 3. Retrieve relevant clauses using semantic search.
 4. Determine claim decisions (approve/reject) and explain reasoning.
+5. Validate decisions using a multi-agent system for compliance assurance.
 
 ---
 
@@ -78,37 +79,62 @@ streamlit run app.py
 
 * Method: `POST`
 * Description: Upload and index PDF documents.
+* Input: `multipart/form-data` with `file`
+* Output: Success message or error
 
 ### `/query`
 
 * Method: `POST`
 * Description: Submit a natural language claim question.
-* Returns: JSON with decision, amount, and justification.
+* Input: `{ "query": "Can a 45M get heart surgery in Pune?" }`
+* Output:
+
+```json
+{
+  "decision": "approved",
+  "amount": "50,000",
+  "justification": "Yes, clause 2.3 allows this (Policy, p.10)."
+}
+```
 
 ### `/run`
 
 * Method: `GET`
 * Description: Triggers CrewAI agents to extract and validate policies.
+* Output: Multi-agent reasoning result
 
 ---
 
 ## 🧠 How It Works
 
-1. **Upload Phase**
+### 1. **Upload Phase**
 
-   * PDF is parsed into chunks.
-   * Chunks are embedded and stored in ChromaDB.
+* PDF is parsed using `PyPDFLoader`
+* Chunked with `RecursiveCharacterTextSplitter`
+* Embedded using `OpenAIEmbeddings`
+* Stored in ChromaDB with metadata
 
-2. **Query Phase**
+### 2. **Query Phase**
 
-   * User asks a natural question.
-   * Top 5 relevant chunks retrieved semantically.
-   * GPT-4 answers using the context with citations.
+* Query sent to `/query`
+* Top 5 chunks retrieved from vectorstore
+* GPT-4 answers using prompt template with citation format
 
-3. **Multi-Agent Validation** (Optional)
+### 3. **Multi-Agent Reasoning (CrewAI)**
 
-   * Claims Expert extracts claim data.
-   * Compliance Agent checks rules.
+* **Agent 1:** Insurance Claims Expert extracts structured info
+* **Agent 2:** Compliance Validator reviews for policy alignment
+* Crew output offers interpretability & validation beyond raw LLM response
+
+---
+
+## 🧪 Improvements Implemented
+
+* Deduplication by document name
+* Modularized PDF processing and vectorstore logic
+* Pydantic model usage for strong request validation
+* Error handling for empty vectorstore, corrupted PDFs
+* JSON response for easy integration into downstream systems
 
 ---
 
@@ -126,6 +152,7 @@ streamlit run app.py
 * Works even if query is vague or incomplete
 * Full explainability via clause citation
 * JSON output for audit or workflow integration
+* Modular CrewAI logic for enterprise-grade rule-checking
 
 ### Sample Output
 
@@ -141,10 +168,11 @@ streamlit run app.py
 
 ## 📌 Future Enhancements
 
-* Document deduplication
-* Multi-modal input (emails, images)
-* Fine-tuned LLM for domain-specific logic
-* Streaming output and real-time feedback
+* Document hash-based deduplication
+* Parallel agent execution with task orchestration
+* Streaming response with real-time citations
+* Fine-tuned LLM for insurance-specific reasoning
+* Multi-modal document ingestion (images, tables)
 
 ---
 
