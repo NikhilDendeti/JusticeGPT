@@ -1,30 +1,22 @@
-# main.py
-
 import os
-import json
-import PyPDF2
-from typing import List
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from dotenv import load_dotenv
-from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.docstore.document import Document
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+from crewai import Crew, Agent, Task
+from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
+from dotenv import load_dotenv
+from pydantic import BaseModel
 
-# Load environment variables
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY not found in .env file")
 
-# FastAPI app instance
 app = FastAPI()
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,93 +25,148 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# LangChain components
-embedding_model = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-llm = ChatOpenAI(temperature=0.0, model_name="gpt-4", openai_api_key=OPENAI_API_KEY)
+CHROMA_DIR = "./chroma_store"
+UPLOAD_DIR = "./docs"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Global retriever
-retriever = None
+llm = ChatOpenAI(model_name="gpt-4", temperature=0)
 
-# -------- Helper Functions -------- #
+def process_pdf(file_path: str):
+    loader = PyPDFLoader(file_path)
+    documents = loader.load()
+    return documents
 
-def extract_text_from_pdf(path: str) -> str:
-    with open(path, "rb") as file:
-        reader = PyPDF2.PdfReader(file)
-        return "\n".join([page.extract_text() or "" for page in reader.pages])
-
-def load_pdf_and_split(path: str) -> List[Document]:
-    text = extract_text_from_pdf(path)
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = splitter.split_text(text)
-    return [Document(page_content=chunk, metadata={"source": path}) for chunk in chunks]
-
-def initialize_vector_store(documents: List[Document]) -> FAISS:
-    return FAISS.from_documents(documents, embedding_model)
-
-def parse_user_query(query: str) -> dict:
-    system_prompt = (
-        "You are a smart query interpreter for insurance documents. "
-        "Extract structured data from the user query. "
-        "Respond with ONLY valid JSON containing keys: age, gender, procedure, location, policy_duration."
+def create_vectorstore(documents):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = splitter.split_documents(documents)
+    embeddings = OpenAIEmbeddings()
+    vectorstore = Chroma.from_documents(
+        chunks,
+        embedding=embeddings,
+        persist_directory=CHROMA_DIR
     )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": query}
-    ]
-    response = llm.invoke(messages)
-    return json.loads(response.content.strip())
+    return vectorstore
 
-def run_reasoning_engine(parsed_query: dict, relevant_chunks: List[Document]) -> dict:
+def load_vectorstore():
+    retriever = Chroma(
+        persist_directory=CHROMA_DIR,
+        embedding_function=OpenAIEmbeddings()
+    ).as_retriever(search_kwargs={"k": 5})
+    return retriever
+
+def get_qa_chain():
+    if not os.path.exists(CHROMA_DIR) or not os.listdir(CHROMA_DIR):
+        return None
+    
+    retriever = load_vectorstore()
+
     prompt_template = PromptTemplate(
-        input_variables=["query", "clauses"],
-        template=(
-            "You are an insurance decision engine.\n"
-            "Given the structured user query and the relevant insurance clauses, decide if the claim is approved.\n"
-            "Respond ONLY with a JSON object with keys:\n"
-            "- decision: approved/rejected\n"
-            "- amount: ₹ or number if applicable\n"
-            "- justification: explanation with clause references\n\n"
-            "User Query:\n{query}\n\nRelevant Clauses:\n{clauses}"
-        )
+        input_variables=["context", "question"],
+        template="""
+You are an insurance assistant. Based on the policy document and claims information provided below, answer the question.
+
+Use only the context. Cite like (Policy, p.12). If not found, say "Not available in the documents."
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:
+"""
     )
 
-    formatted_prompt = prompt_template.format(
-        query=json.dumps(parsed_query, indent=2),
-        clauses="\n\n".join([doc.page_content for doc in relevant_chunks])
+    chain = RetrievalQA.from_chain_type(
+        llm=ChatOpenAI(model_name="gpt-4", temperature=0),
+        chain_type="stuff",
+        retriever=retriever,
+        return_source_documents=False,
+        chain_type_kwargs={"prompt": prompt_template}
     )
+    return chain
 
-    result = llm.invoke(formatted_prompt)
-    return json.loads(result.content.strip())
+@app.post("/upload-docs")
+async def upload_pdf(file: UploadFile = File(...)):
+    file_location = os.path.join(UPLOAD_DIR, file.filename)
+    with open(file_location, "wb") as f:
+        f.write(await file.read())
 
-# -------- Request Schema -------- #
+    documents = process_pdf(file_location)
+    create_vectorstore(documents)
+
+    return {"message": f"{file.filename} processed and vector store created."}
 
 class QueryRequest(BaseModel):
     query: str
 
-# -------- API Endpoints -------- #
-
-@app.post("/upload-docs")
-async def upload_docs(files: List[UploadFile] = File(...)):
-    all_docs = []
-    for file in files:
-        path = f"/tmp/{file.filename}"
-        with open(path, "wb") as f:
-            f.write(await file.read())
-        all_docs.extend(load_pdf_and_split(path))
-
-    global retriever
-    retriever = initialize_vector_store(all_docs)
-    return JSONResponse({"message": "Documents uploaded and indexed successfully."})
-
 @app.post("/query")
-async def handle_query(req: QueryRequest):
-    if not retriever:
-        return JSONResponse({"error": "No documents uploaded yet."}, status_code=400)
+async def run_query(request: QueryRequest):
+    chain = get_qa_chain()
+    if chain is None:
+        return {"error": "Vectorstore not available. Upload a document first."}
 
-    try:
-        parsed_query = parse_user_query(req.query)
-        relevant_docs = retriever.similarity_search(req.query, k=5)
-        result = run_reasoning_engine(parsed_query, relevant_docs)
-        return JSONResponse(result)
-    except Exception as e:
-        return JSONResponse({"error": f"Processing failed: {str(e)}"}, status_code=500)
+    result = chain.run(request.query)
+    return {
+        "decision": "approved" if "yes" in result.lower() else "rejected",
+        "amount": "50,000" if "yes" in result.lower() else "0",
+        "justification": result
+    }
+
+def create_agents():
+    claims_agent = Agent(
+        role="Insurance Claims Expert",
+        goal="Extract and validate insurance policy claims",
+        backstory="Expert in reading and understanding policy documents and claims structure.",
+        verbose=True,
+        allow_delegation=False,
+        llm=llm
+    )
+
+    validation_agent = Agent(
+        role="Policy Compliance Validator",
+        goal="Cross-check extracted claims against policy compliance",
+        backstory="Experienced in verifying if the extracted claims follow all insurance rules.",
+        verbose=True,
+        allow_delegation=False,
+        llm=llm
+    )
+
+    return claims_agent, validation_agent
+
+def create_crew(document_text):
+    claims_agent, validation_agent = create_agents()
+
+    task1 = Task(
+        description=f"Extract and structure relevant claims from the following policy document:\n{document_text}",
+        expected_output="A structured summary of the extracted claims",
+        agent=claims_agent
+    )
+
+    task2 = Task(
+        description="Validate the extracted claims against compliance rules and highlight any issues.",
+        expected_output="Compliance status of each claim with necessary comments",
+        agent=validation_agent
+    )
+
+    crew = Crew(
+        agents=[claims_agent, validation_agent],
+        tasks=[task1, task2],
+        verbose=True
+    )
+
+    return crew
+
+@app.get("/run")
+def run_agents():
+    pdf_files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(".pdf")]
+    if not pdf_files:
+        return {"error": "No PDF files found in docs/"}
+
+    file_path = os.path.join(UPLOAD_DIR, pdf_files[0])
+    documents = process_pdf(file_path)
+    document_text = "\n".join([doc.page_content for doc in documents])
+
+    crew = create_crew(document_text)
+    result = crew.kickoff()
+
+    return {"result": result}
